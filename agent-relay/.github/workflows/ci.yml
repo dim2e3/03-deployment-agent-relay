@@ -1,0 +1,106 @@
+name: CI
+
+# A GitHub-hosted runner can't reach the kind cluster on your own machine, so
+# on real GitHub Actions this creates its own disposable kind cluster inside
+# the job. Run locally with `act` (which executes jobs as sibling Docker
+# containers on the same Docker daemon as your shell), and it reuses the kind
+# cluster you already have running, loading each build straight into it.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: Test against PostgreSQL
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: agent_relay
+          POSTGRES_USER: agent_relay
+          POSTGRES_PASSWORD: agent_relay
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U agent_relay -d agent_relay"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      RELAY_DATABASE_URL: postgresql+psycopg://agent_relay:agent_relay@localhost:5433/agent_relay
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.9.5"
+
+      - run: uv sync
+
+      # Runs the whole suite -- the starter's protocol/concurrency/dashboard
+      # tests plus test_full_task_exchange_sender_sees_completed_status --
+      # against real PostgreSQL rather than the SQLite default, exercising
+      # the FOR UPDATE / SKIP LOCKED row-locking path from database.py.
+      - run: uv run pytest -q
+
+  build-and-deploy:
+    name: Build image and deploy to kind
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kubectl and kind if missing
+        run: |
+          command -v kubectl >/dev/null || {
+            curl -Lo /tmp/kubectl "https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+            chmod +x /tmp/kubectl
+            sudo mv /tmp/kubectl /usr/local/bin/kubectl
+          }
+          command -v kind >/dev/null || {
+            curl -Lo /tmp/kind https://kind.sigs.k8s.io/dl/v0.30.0/kind-linux-amd64
+            chmod +x /tmp/kind
+            sudo mv /tmp/kind /usr/local/bin/kind
+          }
+
+      # Reuses an existing "agent-relay" cluster (e.g. one you already have
+      # running locally) instead of always creating a fresh one, so a unique
+      # tag on every image is actually necessary: kind never re-pulls a tag
+      # it thinks it already has cached on the node.
+      - name: Ensure the kind cluster exists
+        run: kind get clusters | grep -qx agent-relay || kind create cluster --name agent-relay
+
+      - name: Point kubectl at the cluster
+        run: kind export kubeconfig --name agent-relay
+
+      - name: Build a uniquely tagged image
+        id: image
+        run: |
+          TAG="ci-$(date -u +%Y%m%d%H%M%S)"
+          docker build -t "agent-relay:$TAG" .
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Load image into kind
+        run: kind load docker-image "agent-relay:${{ steps.image.outputs.tag }}" --name agent-relay
+
+      - name: Apply manifests
+        run: kubectl apply -f k8s/
+
+      - name: Roll out the new image
+        run: |
+          kubectl -n agent-relay set image deployment/agent-relay "agent-relay=agent-relay:${{ steps.image.outputs.tag }}"
+          kubectl -n agent-relay rollout status deployment/postgres --timeout=120s
+          kubectl -n agent-relay rollout status deployment/agent-relay --timeout=120s
+
+      - name: Smoke test the deployed API
+        run: |
+          kubectl -n agent-relay run "smoke-test-${{ steps.image.outputs.tag }}" --rm -i --restart=Never \
+            --image=curlimages/curl:8.11.1 -- \
+            curl -sf http://agent-relay:8000/ready
+
+      - name: Show pod status
+        if: always()
+        run: kubectl -n agent-relay get pods,svc,pvc -o wide
